@@ -1,61 +1,103 @@
 import os
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+
 from app.core.config import settings
 from app.core.database import engine, Base
 from app.core.logging import logger
 from sqlalchemy.exc import SQLAlchemyError
+
 from app.core.exceptions import DomainException
 from app.middleware.logging_middleware import RequestLoggingMiddleware
-from app.middleware.error_handler import domain_exception_handler, db_exception_handler, global_exception_handler
+from app.middleware.error_handler import (
+    domain_exception_handler,
+    db_exception_handler,
+    global_exception_handler,
+)
 from app.routes.api_v1 import api_v1_router
 
 
 # ---------------------------------------------------------------------------
-# Lifespan: runs AFTER uvicorn binds the port — safe for Render port scan
+# Lifespan
+# Runs after Uvicorn binds the port.
+# This is safe for Render's port detection.
 # ---------------------------------------------------------------------------
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup/shutdown lifecycle managed by uvicorn after socket bind."""
-    # ── Startup ──────────────────────────────────────────────────────────────
+    """Startup/shutdown lifecycle managed by Uvicorn."""
+
+    # -----------------------------------------------------------------------
+    # Startup
+    # -----------------------------------------------------------------------
+
     raw_env_url = os.getenv("DATABASE_URL")
+
     if raw_env_url:
         from app.core.database import mask_db_url
-        logger.info(f"DATABASE_URL detected in environment: {mask_db_url(raw_env_url)}")
+
+        logger.info(
+            f"DATABASE_URL detected in environment: "
+            f"{mask_db_url(raw_env_url)}"
+        )
     else:
         logger.warning(
-            "DATABASE_URL environment variable is NOT set in environment! "
-            "Falling back to default database setting. "
-            "IMPORTANT: In Render Dashboard, set DATABASE_URL to your Render PostgreSQL Internal Database URL."
+            "DATABASE_URL environment variable is NOT set. "
+            "Falling back to the default database setting. "
+            "IMPORTANT: Set DATABASE_URL in the Render Dashboard "
+            "to your Render PostgreSQL Internal Database URL."
         )
 
-    # Database table creation — deferred so the port is already bound.
+    # -----------------------------------------------------------------------
+    # Database table creation
+    # Deferred until application startup so the port is already bound.
+    # -----------------------------------------------------------------------
+
     try:
         Base.metadata.create_all(bind=engine)
         logger.info("Database tables verified / created.")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.error(f"DB create_all failed (non-fatal): {exc}")
 
-    # ChromaDB / fallback vector-store singleton — deferred for same reason.
+    # -----------------------------------------------------------------------
+    # ChromaDB / fallback vector store
+    # Deferred for the same reason.
+    # -----------------------------------------------------------------------
+
     try:
         from app.services.chroma_service import chroma_service  # noqa: F401
+
         logger.info("ChromaDB / vector-store initialised.")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.error(f"Vector-store init failed (non-fatal): {exc}")
 
+    # -----------------------------------------------------------------------
+    # Startup complete
+    # -----------------------------------------------------------------------
+
     logger.info(
-        f"Application startup complete — HOST=0.0.0.0 PORT={os.environ.get('PORT', settings.PORT)}"
+        "Application startup complete — "
+        f"HOST=0.0.0.0 "
+        f"PORT={os.environ.get('PORT', settings.PORT)}"
     )
+
     yield
-    # ── Shutdown ─────────────────────────────────────────────────────────────
+
+    # -----------------------------------------------------------------------
+    # Shutdown
+    # -----------------------------------------------------------------------
+
     logger.info("Application shutdown.")
 
+
 # ---------------------------------------------------------------------------
-# Application
+# FastAPI Application
 # ---------------------------------------------------------------------------
+
 app = FastAPI(
     title=settings.APP_NAME,
     description="AI-powered Personal Finance & Expense Advisor",
@@ -65,34 +107,26 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
 # ---------------------------------------------------------------------------
-# Middleware
-# Starlette processes middlewares in REVERSE registration order.
-# The LAST middleware added runs FIRST on every incoming request.
-# CORSMiddleware MUST be added last so it is the outermost layer.
+# CORS Configuration
 #
-# Registration order (outermost → innermost at runtime):
-#   CORSMiddleware  ← outermost, handles OPTIONS preflights & injects headers
-#   RequestLoggingMiddleware
-#   Application routes
+# CORSMiddleware is added LAST so it becomes the outermost middleware
+# at runtime.
+#
+# This allows:
+#   - Production Vercel deployment
+#   - Vercel preview deployments
+#   - Local development
 # ---------------------------------------------------------------------------
 
-# 1. Logging middleware — added first, so it runs SECOND at runtime.
-#    Implemented as a pure ASGI callable (NOT BaseHTTPMiddleware) to avoid
-#    the known Starlette bug where BaseHTTPMiddleware strips CORS headers
-#    from error responses before CORSMiddleware can attach them.
-app.add_middleware(RequestLoggingMiddleware)
-
-# 2. CORS middleware — added LAST, so it runs FIRST at runtime.
-#    Explicitly list every known origin AND use allow_origin_regex as a
-#    dynamic catch-all for all Vercel preview/production deployments.
-#    With allow_credentials=True, Starlette reflects the exact requesting
-#    origin back (never a bare "*"), which satisfies browser CORS rules.
 CORS_ORIGINS = [
-    # Production Vercel deployment (stable alias)
+    # Production Vercel deployment
     "https://ai-budget-expense-advisor.vercel.app",
-    # Current Vercel preview / deployment URL (set FRONTEND_URL on Render)
+
+    # FRONTEND_URL configured through environment variables
     settings.FRONTEND_URL,
+
     # Local development
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -101,37 +135,81 @@ CORS_ORIGINS = [
     "http://localhost:8000",
     "http://127.0.0.1:8000",
 ]
-# Deduplicate while preserving order (in case FRONTEND_URL matches a listed origin)
-seen = set()
-CORS_ORIGINS_DEDUPED = [x for x in CORS_ORIGINS if not (x in seen or seen.add(x))]
+
+
+# Remove empty values and duplicates while preserving order.
+CORS_ORIGINS_DEDUPED = list(
+    dict.fromkeys(
+        origin.strip()
+        for origin in CORS_ORIGINS
+        if origin and origin.strip()
+    )
+)
+
 
 app.add_middleware(
     CORSMiddleware,
+
+    # Explicitly allowed origins
     allow_origins=CORS_ORIGINS_DEDUPED,
-    allow_origin_regex=r"https://.*\.vercel\.app",   # covers ALL *.vercel.app URLs
+
+    # Allow Vercel preview deployments such as:
+    # https://project-git-main-xxxx.vercel.app
+    allow_origin_regex=r"https://.*\.vercel\.app",
+
+    # Authentication / credentials support
     allow_credentials=True,
+
+    # HTTP methods
     allow_methods=["*"],
+
+    # Request headers
     allow_headers=["*"],
+
+    # Response headers exposed to frontend
     expose_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# Exception handlers
-# These are NOT middleware — they do not affect the middleware stack order.
-# ---------------------------------------------------------------------------
-app.add_exception_handler(DomainException, domain_exception_handler)
-app.add_exception_handler(SQLAlchemyError, db_exception_handler)
-app.add_exception_handler(Exception, global_exception_handler)
 
 # ---------------------------------------------------------------------------
-# Routers — always included AFTER middleware is configured
+# Middleware
 # ---------------------------------------------------------------------------
+
+# Request logging middleware
+app.add_middleware(RequestLoggingMiddleware)
+
+
+# ---------------------------------------------------------------------------
+# Exception Handlers
+# ---------------------------------------------------------------------------
+
+app.add_exception_handler(
+    DomainException,
+    domain_exception_handler,
+)
+
+app.add_exception_handler(
+    SQLAlchemyError,
+    db_exception_handler,
+)
+
+app.add_exception_handler(
+    Exception,
+    global_exception_handler,
+)
+
+
+# ---------------------------------------------------------------------------
+# API Routers
+# ---------------------------------------------------------------------------
+
 app.include_router(api_v1_router)
 
 
 # ---------------------------------------------------------------------------
-# Root & health endpoints
+# Root Endpoint
 # ---------------------------------------------------------------------------
+
 @app.get("/", tags=["Health"])
 def root():
     return {
@@ -143,29 +221,60 @@ def root():
 
 
 # ---------------------------------------------------------------------------
-# Optional: serve bundled frontend static files
+# Optional: Serve bundled frontend static files
+#
+# This is useful for local development or if the frontend is served
+# through FastAPI.
+#
+# Your production frontend will still be deployed separately on Vercel.
 # ---------------------------------------------------------------------------
+
 _frontend_dir = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "frontend")
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "frontend",
+    )
 )
+
+
 if os.path.exists(_frontend_dir):
-    app.mount("/static", StaticFiles(directory=_frontend_dir), name="static")
+
+    app.mount(
+        "/static",
+        StaticFiles(directory=_frontend_dir),
+        name="static",
+    )
 
     @app.get("/app", include_in_schema=False)
     def serve_frontend_index():
-        return FileResponse(os.path.join(_frontend_dir, "index.html"))
+        return FileResponse(
+            os.path.join(
+                _frontend_dir,
+                "index.html",
+            )
+        )
 
+
+# ---------------------------------------------------------------------------
+# Application Initialisation Log
+# ---------------------------------------------------------------------------
 
 logger.info(
     "FastAPI application initialised. "
-    f"CORS origins: {CORS_ORIGINS_DEDUPED} + regex *.vercel.app"
+    f"CORS origins: {CORS_ORIGINS_DEDUPED} "
+    "+ regex *.vercel.app"
 )
 
+
 # ---------------------------------------------------------------------------
-# Local dev entry-point
+# Local Development Entry Point
 # ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
         "app.main:app",
         host=settings.HOST,
