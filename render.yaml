@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: ai-budget-expense-advisor
+    name: ai-expense-budget-manager
     runtime: python
     rootDir: backend
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt && python -m alembic upgrade head || echo "WARNING: Alembic migration skipped — ensure DATABASE_URL is set in Render Dashboard environment variables"
